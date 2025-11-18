@@ -1,11 +1,590 @@
 # Instaloader 기능별 심층 분석
 
 ## 목차
+0. [기초 개념: 웹은 어떻게 작동하는가?](#0-기초-개념-웹은-어떻게-작동하는가)
 1. [익명 다운로드는 어떻게 가능한가?](#1-익명-다운로드는-어떻게-가능한가)
 2. [로그인이 필수인 기능들과 그 이유](#2-로그인이-필수인-기능들과-그-이유)
 3. [핵심 메커니즘: GraphQL API 활용](#3-핵심-메커니즘-graphql-api-활용)
 4. [Selenium과의 차이점](#4-selenium과의-차이점)
 5. [기능별 실행 플로우](#5-기능별-실행-플로우)
+
+---
+
+## 0. 기초 개념: 웹은 어떻게 작동하는가?
+
+Instaloader를 이해하려면 먼저 **웹이 어떻게 작동하는지** 알아야 함. 많은 사람들이 당연하게 여기지만, 실제로는 복잡한 과정이 숨어있음.
+
+### 0.1 웹 브라우저는 무엇을 하는가?
+
+#### 일반인이 보는 과정
+```
+1. 주소창에 "instagram.com/nike" 입력
+2. 엔터 키
+3. 페이지가 짠! 하고 나타남
+```
+
+간단해 보이지만, 실제로는 **수십 개의 복잡한 단계**가 숨어있음.
+
+#### 실제로 벌어지는 일 (상세 버전)
+
+```mermaid
+sequenceDiagram
+    participant U as 사용자
+    participant B as 브라우저
+    participant DNS as DNS 서버
+    participant IG as Instagram 서버
+    participant CDN as CDN (이미지 서버)
+
+    U->>B: instagram.com/nike 입력
+
+    Note over B: 1단계: 주소 해석
+    B->>DNS: "instagram.com이 어디 있어?"
+    DNS-->>B: "IP: 157.240.24.174"
+
+    Note over B: 2단계: 서버 연결
+    B->>IG: TCP 연결 (3-way handshake)
+    IG-->>B: 연결 성공
+
+    Note over B: 3단계: HTTPS 보안 설정
+    B->>IG: SSL/TLS 인증서 요청
+    IG-->>B: 인증서 전달
+    B->>B: 인증서 검증
+
+    Note over B: 4단계: HTML 요청
+    B->>IG: GET /nike HTTP/1.1
+    Note over B,IG: Host: instagram.com, User-Agent: Chrome/142...
+    IG-->>B: HTML 파일 (약 50KB)
+
+    Note over B: 5단계: HTML 파싱
+    B->>B: HTML 읽기 시작
+    B->>B: script 태그 발견!
+    B->>B: link 태그 발견!
+    B->>B: img 태그 발견!
+
+    Note over B: 6단계: 추가 자원 다운로드
+    B->>IG: JavaScript 파일 10개 요청
+    IG-->>B: JS 파일들 (총 2MB)
+    B->>IG: CSS 파일 5개 요청
+    IG-->>B: CSS 파일들 (총 500KB)
+
+    Note over B: 7단계: JavaScript 실행
+    B->>B: JavaScript 엔진 가동
+    B->>B: React 초기화
+    B->>IG: GraphQL API 호출 (프로필 데이터 요청!)
+    IG-->>B: JSON 데이터 (프로필 정보)
+
+    Note over B: 8단계: 이미지 다운로드
+    B->>CDN: 프로필 사진 요청
+    CDN-->>B: 프로필 사진 (200KB)
+    B->>CDN: 게시글 이미지 12개 요청
+    CDN-->>B: 이미지들 (총 5MB)
+
+    Note over B: 9단계: 렌더링
+    B->>B: CSS 적용
+    B->>B: 레이아웃 계산
+    B->>B: 화면에 그리기
+
+    B->>U: 페이지 표시 완료!
+```
+
+💡 **핵심 포인트:**
+- 브라우저는 **단순히 HTML만 받는 게 아님**
+- HTML → JavaScript → CSS → 이미지 → 데이터(JSON) 순서로 여러 번 요청함
+- 총 **30~50번의 네트워크 요청**이 발생함
+- 전체 다운로드 용량: **5~10MB** 정도
+
+#### 왜 이렇게 복잡한가?
+
+**역사적 이유:**
+```
+1990년대 웹 (단순):
+  - HTML만 있음
+  - 정적인 페이지 (변화 없음)
+  - 예: <html><body>안녕하세요</body></html>
+
+2000년대 웹 (동적):
+  - HTML + CSS + JavaScript
+  - 사용자 상호작용 가능
+  - 예: 버튼 클릭하면 색깔 바뀜
+
+2020년대 웹 (앱처럼):
+  - HTML + CSS + JavaScript + API + 실시간 데이터
+  - 완전한 애플리케이션처럼 동작
+  - 예: Instagram = 웹인데 앱처럼 느껴짐
+```
+
+### 0.2 HTTP 요청과 응답이란?
+
+웹의 모든 통신은 **HTTP(HyperText Transfer Protocol)** 프로토콜을 사용함.
+
+#### HTTP 요청 (Request) 구조
+
+실제로 브라우저가 보내는 데이터:
+
+```http
+GET /nike HTTP/1.1
+Host: instagram.com
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/142.0.0.0
+Accept: text/html,application/json
+Accept-Language: en-US,en;q=0.9
+Accept-Encoding: gzip, deflate, br
+Cookie: sessionid=abc123xyz; csrftoken=def456
+Connection: keep-alive
+```
+
+**각 줄의 의미:**
+
+| 부분 | 설명 | 비유 |
+|------|------|------|
+| `GET /nike` | "nike 페이지를 달라" | 우체국에서 "우편물 주세요" |
+| `Host: instagram.com` | "instagram.com 서버야" | "서울 강남구 주소로" |
+| `User-Agent: Chrome/142...` | "나는 크롬 브라우저야" | "제 신분증입니다" |
+| `Accept: text/html` | "HTML 형식으로 줘" | "한글로 적어주세요" |
+| `Accept-Language: en-US` | "영어로 줘" | "영어 버전 주세요" |
+| `Accept-Encoding: gzip` | "압축해서 보내도 돼" | "압축 파일로 보내도 됩니다" |
+| `Cookie: sessionid=...` | "내 신원 확인용 티켓" | "회원카드입니다" |
+
+#### HTTP 응답 (Response) 구조
+
+Instagram 서버가 보내는 데이터:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 51234
+Content-Encoding: gzip
+Set-Cookie: csrftoken=new_token_xyz; Path=/
+Cache-Control: no-cache, no-store
+Date: Sat, 18 Jan 2025 12:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Nike (@nike) • Instagram</title>
+  ...
+</head>
+<body>
+  ...실제 HTML 내용...
+</body>
+</html>
+```
+
+**각 줄의 의미:**
+
+| 부분 | 설명 | 비유 |
+|------|------|------|
+| `HTTP/1.1 200 OK` | "성공적으로 처리했어" | "우편물 찾았습니다" |
+| `Content-Type: text/html` | "HTML 파일이야" | "문서 형식입니다" |
+| `Content-Length: 51234` | "크기는 51,234바이트야" | "무게 51kg" |
+| `Content-Encoding: gzip` | "gzip으로 압축했어" | "압축해서 보냈어요" |
+| `Set-Cookie: ...` | "이 티켓 저장해줘" | "다음엔 이 번호표 보여주세요" |
+| `Cache-Control: no-cache` | "캐시하지 마" | "매번 새로 확인하세요" |
+
+#### 💡 핵심 개념: 상태 코드 (Status Code)
+
+서버의 응답 상태를 숫자로 표현함:
+
+```
+2XX: 성공
+  - 200 OK: 정상 처리
+  - 201 Created: 새로 만들어짐
+
+3XX: 리다이렉션 (다른 곳으로 이동)
+  - 301 Moved Permanently: 영구 이동
+  - 302 Found: 임시 이동
+
+4XX: 클라이언트 에러 (요청이 잘못됨)
+  - 400 Bad Request: 잘못된 요청
+  - 401 Unauthorized: 인증 필요
+  - 403 Forbidden: 권한 없음
+  - 404 Not Found: 없음
+  - 429 Too Many Requests: 요청 너무 많음 ← Instagram이 자주 보냄!
+
+5XX: 서버 에러 (서버 문제)
+  - 500 Internal Server Error: 서버 오류
+  - 503 Service Unavailable: 서비스 불가
+```
+
+### 0.3 쿠키(Cookie)란 무엇인가?
+
+쿠키는 **브라우저가 저장하는 작은 텍스트 파일**임.
+
+#### 왜 쿠키가 필요한가?
+
+**문제 상황:**
+```
+HTTP는 "무상태(Stateless)" 프로토콜임 = 기억력이 없음
+
+사용자: (로그인) "아이디: user1, 비밀번호: pass1"
+서버: "OK! 로그인 성공"
+
+[1분 후]
+사용자: (게시글 보기) "내 피드 보여줘"
+서버: "넌 누구야? 다시 로그인해" ← 방금 로그인했는데!
+
+이래서는 매 요청마다 로그인해야 함 → 불편!
+```
+
+**해결책: 쿠키**
+```
+사용자: (로그인) "아이디: user1, 비밀번호: pass1"
+서버: "OK! 이 티켓 받아: sessionid=abc123xyz" ← 쿠키!
+브라우저: (쿠키 저장)
+
+[1분 후]
+사용자: (게시글 보기) "내 피드 보여줘. 티켓: sessionid=abc123xyz"
+서버: "아, abc123xyz는 user1이구나! 여기 피드" ← 기억함!
+```
+
+#### 쿠키의 구조
+
+```javascript
+// 실제 Instagram 쿠키 예시
+document.cookie = "sessionid=IGSCab8d3f2e1a4c5b6d7e8f9; Domain=.instagram.com; Path=/; Secure; HttpOnly; Max-Age=31536000"
+```
+
+**각 부분의 의미:**
+
+| 속성 | 값 | 설명 |
+|------|-----|------|
+| `sessionid` | 이름 | 이 쿠키의 이름 (로그인 세션 ID) |
+| `IGSCab8d3f2e1a4c5b6d7e8f9` | 값 | 실제 세션 식별자 (암호화됨) |
+| `Domain=.instagram.com` | 도메인 | instagram.com과 모든 서브도메인에서 사용 |
+| `Path=/` | 경로 | 모든 경로에서 이 쿠키 전송 |
+| `Secure` | 보안 | HTTPS에서만 전송 (HTTP는 안 됨) |
+| `HttpOnly` | HTTP 전용 | JavaScript로 접근 불가 (보안) |
+| `Max-Age=31536000` | 유효기간 | 1년 (초 단위) |
+
+#### 쿠키 vs 세션
+
+```
+쿠키 (Cookie):
+  - 브라우저에 저장됨
+  - 클라이언트가 관리
+  - 용량 제한: 4KB
+  - 예: sessionid=abc123
+
+세션 (Session):
+  - 서버에 저장됨
+  - 서버가 관리
+  - 용량 제한 없음
+  - 예: {user_id: 123, username: "nike", login_time: ...}
+
+둘의 관계:
+  쿠키(sessionid) ← 열쇠
+  세션(서버 데이터) ← 금고
+
+  쿠키를 보내면 → 서버가 세션을 찾음
+```
+
+### 0.4 API란 무엇인가?
+
+**API (Application Programming Interface)** = **프로그램들이 대화하는 방법**
+
+#### 일상 비유
+
+```
+레스토랑 = 서버
+손님 = 클라이언트 (브라우저)
+메뉴판 = API 문서
+주문 = API 요청
+음식 = API 응답
+
+손님: "메뉴판 보고 불고기버거 주세요" ← 정해진 형식으로 주문
+직원: "네, 여기 불고기버거입니다" ← 정해진 형식으로 응답
+
+만약 메뉴판 없이:
+손님: "고기 있는 빵 사이에 낀 거요"
+직원: "??? 뭘 원하시는지 모르겠어요"
+```
+
+#### 웹 API의 종류
+
+**1. REST API (전통적 방식)**
+
+```
+규칙: URL로 자원을 표현함
+
+예시:
+  GET /api/users/123          → 사용자 123번 정보 가져오기
+  GET /api/users/123/posts    → 사용자 123번의 게시글 가져오기
+  POST /api/users             → 새 사용자 만들기
+  PUT /api/users/123          → 사용자 123번 수정
+  DELETE /api/users/123       → 사용자 123번 삭제
+
+장점: 이해하기 쉬움
+단점: 여러 정보 받으려면 여러 번 요청해야 함
+```
+
+**2. GraphQL API (현대적 방식, Instagram이 사용)**
+
+```
+규칙: 한 번에 원하는 것만 정확히 요청
+
+예시:
+  POST /graphql
+  {
+    user(id: 123) {
+      name
+      posts(first: 10) {
+        title
+        likes
+      }
+    }
+  }
+
+  → 사용자 이름 + 최근 게시글 10개(제목, 좋아요)를 한 번에!
+
+장점: 필요한 것만 받음, 요청 횟수 적음
+단점: 배우기 어려움
+```
+
+#### Instagram의 GraphQL API 구조
+
+```
+엔드포인트 (Endpoint):
+  https://www.instagram.com/graphql/query
+
+요청 방식:
+  POST (데이터를 body에 담아 보냄)
+
+요청 형식:
+  {
+    "doc_id": "7950326061742207",     ← 어떤 쿼리인지 (메뉴 번호)
+    "variables": {                    ← 상세 옵션
+      "id": "25025320",               ← nike의 사용자 ID
+      "first": 12                     ← 12개만 가져와
+    }
+  }
+
+응답 형식:
+  {
+    "data": {
+      "user": {
+        "id": "25025320",
+        "username": "nike",
+        "edge_owner_to_timeline_media": {
+          "edges": [
+            {
+              "node": {
+                "shortcode": "ABC123",
+                "display_url": "https://...",
+                "edge_liked_by": {"count": 52341}
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+```
+
+### 0.5 JSON이란 무엇인가?
+
+**JSON (JavaScript Object Notation)** = **데이터를 표현하는 텍스트 형식**
+
+#### 왜 JSON을 사용하는가?
+
+**문제:**
+```
+컴퓨터끼리 데이터를 주고받을 때, 어떻게 표현할까?
+
+나쁜 방법:
+  "사용자 이름은 nike고 팔로워는 300만명이고 게시글은 1234개임"
+  → 파싱하기 어려움
+
+좋은 방법:
+  {"username": "nike", "followers": 3000000, "posts": 1234}
+  → 구조화되어 있어서 프로그램이 쉽게 읽음
+```
+
+#### JSON 문법 기초
+
+```javascript
+// 1. 기본 타입
+{
+  "문자열": "Hello",
+  "숫자": 123,
+  "소수": 3.14,
+  "참거짓": true,
+  "없음": null
+}
+
+// 2. 배열 (리스트)
+{
+  "좋아하는_과일": ["사과", "바나나", "딸기"]
+}
+
+// 3. 중첩 (객체 안에 객체)
+{
+  "사용자": {
+    "이름": "nike",
+    "프로필": {
+      "팔로워": 3000000,
+      "팔로잉": 150
+    }
+  }
+}
+
+// 4. 배열 안에 객체
+{
+  "게시글들": [
+    {"제목": "Just Do It", "좋아요": 5000},
+    {"제목": "New Shoes", "좋아요": 3000}
+  ]
+}
+```
+
+#### Instagram JSON 응답 실제 예시
+
+```json
+{
+  "data": {
+    "user": {
+      "id": "25025320",
+      "username": "nike",
+      "full_name": "Nike",
+      "biography": "Just Do It. Est. 1972",
+      "edge_followed_by": {
+        "count": 300147823
+      },
+      "edge_follow": {
+        "count": 150
+      },
+      "edge_owner_to_timeline_media": {
+        "count": 1234,
+        "edges": [
+          {
+            "node": {
+              "id": "3287362888123456789",
+              "shortcode": "ABC123xyz",
+              "display_url": "https://scontent.cdninstagram.com/.../photo.jpg",
+              "is_video": false,
+              "taken_at_timestamp": 1705622400,
+              "edge_liked_by": {
+                "count": 52341
+              },
+              "edge_media_to_caption": {
+                "edges": [
+                  {
+                    "node": {
+                      "text": "Just Do It #nike #running"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+**이 JSON을 Python에서 읽는 법:**
+
+```python
+import json
+
+# JSON 문자열을 Python 딕셔너리로 변환
+data = json.loads(json_string)
+
+# 데이터 접근
+username = data['data']['user']['username']  # "nike"
+followers = data['data']['user']['edge_followed_by']['count']  # 300147823
+first_post = data['data']['user']['edge_owner_to_timeline_media']['edges'][0]['node']
+post_url = first_post['display_url']  # 이미지 URL
+post_likes = first_post['edge_liked_by']['count']  # 52341
+```
+
+### 0.6 Python requests 라이브러리 기초
+
+**requests** = **Python에서 HTTP 요청을 쉽게 보낼 수 있는 라이브러리**
+
+#### 기본 사용법
+
+```python
+import requests
+
+# 1. 간단한 GET 요청
+response = requests.get('https://instagram.com')
+print(response.status_code)  # 200
+print(response.text)         # HTML 내용
+
+# 2. 헤더 추가
+headers = {
+    'User-Agent': 'Mozilla/5.0 ...',
+    'Accept-Language': 'en-US'
+}
+response = requests.get('https://instagram.com', headers=headers)
+
+# 3. 쿠키 전송
+cookies = {
+    'sessionid': 'abc123xyz'
+}
+response = requests.get('https://instagram.com', cookies=cookies)
+
+# 4. POST 요청 (데이터 보내기)
+data = {
+    'username': 'myuser',
+    'password': 'mypass'
+}
+response = requests.post('https://instagram.com/login', data=data)
+
+# 5. JSON 응답 파싱
+response = requests.get('https://api.example.com/user/123')
+user_data = response.json()  # 자동으로 JSON → Python 딕셔너리
+print(user_data['name'])
+```
+
+#### requests.Session() - 쿠키 자동 관리
+
+```python
+import requests
+
+# Session 없이 (쿠키 수동 관리)
+response1 = requests.get('https://instagram.com')
+cookies = response1.cookies  # 쿠키 저장
+response2 = requests.get('https://instagram.com/nike', cookies=cookies)  # 쿠키 재사용
+
+# Session 사용 (쿠키 자동 관리) ← Instaloader가 사용하는 방법!
+session = requests.Session()
+session.get('https://instagram.com')  # 쿠키 자동 저장됨
+session.get('https://instagram.com/nike')  # 저장된 쿠키 자동으로 전송됨
+session.get('https://instagram.com/adidas')  # 또 자동 전송됨!
+```
+
+💡 **Session의 장점:**
+- 쿠키 자동 관리 (매번 cookies= 안 써도 됨)
+- 헤더 한 번만 설정하면 계속 사용됨
+- 연결 재사용으로 속도 향상 (TCP keep-alive)
+
+#### Instaloader가 requests를 사용하는 방법
+
+```python
+class InstaloaderContext:
+    def __init__(self):
+        # Session 객체 생성
+        self._session = requests.Session()
+
+        # 기본 헤더 설정 (모든 요청에 적용됨)
+        self._session.headers.update({
+            'User-Agent': 'Mozilla/5.0 ...',
+            'Accept-Language': 'en-US',
+            'X-Instagram-AJAX': '1'
+        })
+
+    def get_json(self, path, params):
+        """Instagram API 호출"""
+        url = f'https://www.instagram.com/{path}'
+
+        # Session으로 요청 (헤더, 쿠키 자동 포함됨)
+        response = self._session.get(url, params=params)
+
+        # JSON 파싱
+        return response.json()
+```
 
 ---
 
@@ -172,48 +751,400 @@ Instaloader:
 
 둘 다 똑같은 API를 호출하고 있음! 차이점은 받은 데이터를 어떻게 사용하느냐만 다를 뿐.
 
+**실제 네트워크 패킷 비교:**
+
+```http
+=== 크롬 브라우저가 보내는 요청 ===
+POST /graphql/query HTTP/1.1
+Host: www.instagram.com
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/142.0.0.0
+Accept: */*
+Accept-Language: en-US,en;q=0.9
+Content-Type: application/x-www-form-urlencoded
+Cookie: sessionid=...; csrftoken=...
+X-Instagram-AJAX: 1
+X-CSRFToken: ...
+
+doc_id=7950326061742207&variables={"id":"25025320","first":12}
+
+=== Instaloader가 보내는 요청 ===
+POST /graphql/query HTTP/1.1
+Host: www.instagram.com
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/142.0.0.0
+Accept: */*
+Accept-Language: en-US,en;q=0.9
+Content-Type: application/x-www-form-urlencoded
+Cookie: sessionid=...; csrftoken=...
+X-Instagram-AJAX: 1
+X-CSRFToken: ...
+
+doc_id=7950326061742207&variables={"id":"25025320","first":12}
+```
+
+→ **완전히 동일함!** Instagram 서버는 둘을 구별할 수 없음.
+
 #### 이유 2: 속도 제한을 지킴 (Rate Limiting)
 
-너무 빨리 요청하면 봇으로 의심받음. Instaloader는 이를 방지함:
+##### Rate Limiting이란?
+
+**Rate Limiting** = 일정 시간 동안 허용되는 요청 횟수 제한
+
+```
+Instagram의 Rate Limit (추정):
+  - 익명 사용자: 분당 ~20개 요청
+  - 로그인 사용자: 분당 ~60개 요청
+  - 이 이상 요청하면 → 429 Too Many Requests 에러
+
+왜 이런 제한이 있을까?
+  1. 서버 과부하 방지 (수백만 명이 동시 접속)
+  2. 봇/크롤러 차단 (정상 사용자 보호)
+  3. 공정한 자원 배분
+```
+
+##### Instagram이 봇을 탐지하는 방법
+
+```mermaid
+flowchart TD
+    A[Instagram 서버] --> B{요청 패턴 분석}
+
+    B --> C[요청 빈도 체크]
+    C --> C1{"1분에 100개 요청?"}
+    C1 -->|Yes| BLOCK[차단!]
+    C1 -->|No| D
+
+    B --> D[행동 패턴 분석]
+    D --> D1{"모든 요청이<br/>정확히 1초 간격?"}
+    D1 -->|Yes| BLOCK
+    D1 -->|No| E
+
+    B --> E[IP 주소 체크]
+    E --> E1{"같은 IP에서<br/>수천 개 계정 접속?"}
+    E1 -->|Yes| BLOCK
+    E1 -->|No| F
+
+    B --> F[세션 수명 체크]
+    F --> F1{"세션이 10초 만에<br/>100개 프로필 방문?"}
+    F1 -->|Yes| BLOCK
+    F1 -->|No| PASS[통과]
+
+    style BLOCK fill:#f99
+    style PASS fill:#9f9
+```
+
+##### Instaloader의 Rate Limiting 전략
+
+**전략 1: 랜덤 대기 시간**
+
+```python
+import time
+import random
+
+class RateController:
+    def __init__(self):
+        self.sleep = True  # 대기 활성화
+        self.min_delay = 1.0  # 최소 1초
+        self.max_delay = 3.0  # 최대 3초
+
+    def wait_before_query(self, query_type: str):
+        """요청 전에 랜덤하게 대기"""
+        if self.sleep:
+            delay = random.uniform(self.min_delay, self.max_delay)
+            time.sleep(delay)
+
+# 실제 사용 예:
+게시글 1 다운로드 → 2.34초 대기
+게시글 2 다운로드 → 1.87초 대기
+게시글 3 다운로드 → 2.91초 대기
+게시글 4 다운로드 → 1.23초 대기
+
+# 나쁜 봇의 예:
+게시글 1 다운로드 → 1.00초 대기 ← 규칙적!
+게시글 2 다운로드 → 1.00초 대기
+게시글 3 다운로드 → 1.00초 대기
+게시글 4 다운로드 → 1.00초 대기 ← 봇으로 감지됨!
+```
+
+💡 **왜 랜덤이 중요한가?**
+- 사람은 **불규칙적**으로 행동함 (클릭 간격이 매번 다름)
+- 봇은 **규칙적**으로 행동함 (프로그램이니까)
+- 랜덤 = 사람처럼 보이게 하는 핵심!
+
+**전략 2: 429 에러 자동 처리**
+
+```python
+class InstaloaderContext:
+    def get_json(self, path, params, session=None, max_retries=3):
+        """JSON 요청 (에러 자동 처리)"""
+
+        for attempt in range(max_retries):
+            try:
+                response = self._session.get(url, params=params)
+
+                # 상태 코드 체크
+                if response.status_code == 200:
+                    return response.json()  # 성공!
+
+                elif response.status_code == 429:
+                    # Too Many Requests - 요청 한도 초과!
+                    self._handle_rate_limit(response)
+                    # → handle_rate_limit에서 자동으로 대기하고 재시도
+
+                elif response.status_code == 404:
+                    raise ProfileNotFoundError("프로필을 찾을 수 없음")
+
+                elif response.status_code == 403:
+                    raise ForbiddenError("접근 권한 없음")
+
+            except requests.exceptions.ConnectionError:
+                # 네트워크 오류 - 재시도
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
+                raise
+
+    def _handle_rate_limit(self, response):
+        """429 에러 처리"""
+
+        # Retry-After 헤더 확인 (Instagram이 알려주는 대기 시간)
+        retry_after = response.headers.get('Retry-After')
+
+        if retry_after:
+            # Instagram: "600초 후에 다시 시도하세요"
+            wait_time = int(retry_after)
+        else:
+            # 헤더 없으면 기본 600초 (10분)
+            wait_time = 600
+
+        self.log(f"Rate limit! {wait_time}초 대기 중...")
+
+        # 10분 대기를 1분씩 나눠서 진행 상황 표시
+        for i in range(wait_time // 60):
+            time.sleep(60)
+            remaining = wait_time - (i + 1) * 60
+            self.log(f"남은 시간: {remaining}초")
+
+        # 마지막 나머지 초
+        time.sleep(wait_time % 60)
+```
+
+**전략 3: 쿼리 타입별 별도 제한**
 
 ```python
 class RateController:
-    """요청 속도 조절기 - 사람처럼 천천히 행동하기"""
+    def __init__(self):
+        # 쿼리 타입별 마지막 요청 시간 기록
+        self.query_timestamps = {
+            'graphql': [],      # GraphQL 쿼리
+            'iphone': [],       # iPhone API
+            'media': [],        # 미디어 다운로드
+        }
+
+        # 타입별 제한 (초당 요청 수)
+        self.limits = {
+            'graphql': 0.5,   # 2초당 1개
+            'iphone': 1.0,    # 1초당 1개
+            'media': 2.0,     # 0.5초당 1개 (미디어는 조금 빠름)
+        }
 
     def wait_before_query(self, query_type: str):
-        # 요청 전에 1~3초 랜덤하게 대기
-        if self.sleep:
-            time.sleep(random.uniform(1, 3))
-        # 💡 일정한 간격이 아니라 랜덤! → 사람처럼 보임
+        """쿼리 타입에 따라 다른 대기 시간 적용"""
 
-    def handle_429(self, query_type: str):
-        # Instagram이 "너무 많이 요청했어!"라고 하면
-        self.error("Rate limit hit, waiting...")
-        time.sleep(600)  # 10분 대기하고 다시 시도
+        # 최근 요청 시간 가져오기
+        timestamps = self.query_timestamps[query_type]
+        now = time.time()
+
+        # 최근 1분간의 요청만 유지
+        timestamps = [t for t in timestamps if now - t < 60]
+        self.query_timestamps[query_type] = timestamps
+
+        # 요청 수 체크
+        if len(timestamps) > 0:
+            # 마지막 요청으로부터 경과 시간
+            time_since_last = now - timestamps[-1]
+
+            # 제한 시간보다 빠르면 대기
+            min_interval = 1.0 / self.limits[query_type]
+            if time_since_last < min_interval:
+                wait = min_interval - time_since_last
+                time.sleep(wait)
+
+        # 현재 시간 기록
+        self.query_timestamps[query_type].append(time.time())
 ```
 
-💡 **현실 비유:**
-- 나쁜 봇: 1초에 100번 클릭 → 즉시 차단
-- Instaloader: 요청 → 2초 대기 → 요청 → 3초 대기 → ... (사람처럼 행동)
+**전략 4: 지수 백오프 (Exponential Backoff)**
+
+```python
+def download_with_backoff(self, url, max_retries=5):
+    """재시도 시 대기 시간을 점진적으로 늘림"""
+
+    for attempt in range(max_retries):
+        try:
+            return self._download(url)
+
+        except TooManyRequestsException:
+            if attempt == max_retries - 1:
+                raise  # 마지막 시도는 에러 발생
+
+            # 지수 백오프: 2^attempt초 대기
+            wait_time = 2 ** attempt  # 1초 → 2초 → 4초 → 8초 → 16초
+            jitter = random.uniform(0, wait_time * 0.1)  # ±10% 랜덤
+            total_wait = wait_time + jitter
+
+            self.log(f"시도 {attempt + 1} 실패, {total_wait:.1f}초 대기")
+            time.sleep(total_wait)
+
+# 실제 실행 예:
+시도 1: 실패 → 1.05초 대기
+시도 2: 실패 → 2.18초 대기
+시도 3: 실패 → 4.32초 대기
+시도 4: 실패 → 8.77초 대기
+시도 5: 성공!
+```
+
+💡 **지수 백오프가 효과적인 이유:**
+- 일시적 문제 (네트워크 끊김): 빠르게 재시도
+- 지속적 문제 (서버 과부하): 천천히 재시도
+- 서버 부담 감소
 
 #### 이유 3: 브라우저처럼 보이는 헤더
 
-```python
-def _default_http_header(self) -> Dict[str, str]:
-    """실제 브라우저가 보내는 것과 똑같은 헤더"""
-    return {
-        # 크롬 브라우저라고 주장
-        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-                      '(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
-        'Accept-Encoding': 'gzip, deflate',  # 압축 지원
-        'Accept-Language': 'en-US,en;q=0.8', # 영어 선호
-        'X-Instagram-AJAX': '1',              # Instagram 전용 헤더
-        'X-Requested-With': 'XMLHttpRequest', # AJAX 요청임을 표시
-        'Referer': 'https://www.instagram.com/', # 어디서 왔는지
-    }
+##### User-Agent란?
+
+**User-Agent** = "나는 어떤 브라우저/프로그램인지" 알려주는 문자열
+
+```http
+실제 크롬 브라우저:
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36
+
+파이썬 requests (기본값):
+User-Agent: python-requests/2.31.0
+
+→ Instagram은 두 번째를 즉시 차단함!
 ```
 
-이 헤더들은 실제 크롬 브라우저가 보내는 것을 그대로 따라한 것임.
+**User-Agent 문자열 분석:**
+
+```
+Mozilla/5.0
+  ↑ 역사적 이유 (모든 브라우저가 이렇게 시작함)
+
+(Windows NT 10.0; Win64; x64)
+  ↑ 운영체제: Windows 10, 64비트
+
+AppleWebKit/537.36
+  ↑ 렌더링 엔진 버전
+
+(KHTML, like Gecko)
+  ↑ 호환성 표시 (역사적 이유)
+
+Chrome/142.0.0.0
+  ↑ 크롬 버전: 142
+
+Safari/537.36
+  ↑ Safari 호환성 표시
+```
+
+##### Instaloader의 헤더 전략
+
+```python
+def _default_http_header(self, empty_session_only: bool = False) -> Dict[str, str]:
+    """실제 브라우저가 보내는 것과 100% 동일한 헤더"""
+
+    header = {
+        # 1. User-Agent: 최신 크롬 브라우저로 위장
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+
+        # 2. Accept: 어떤 형식을 받을 수 있는지
+        'Accept': '*/*',  # 모든 형식 OK
+
+        # 3. Accept-Language: 선호 언어
+        'Accept-Language': 'en-US,en;q=0.9',  # 영어 선호 (90%)
+
+        # 4. Accept-Encoding: 압축 지원
+        'Accept-Encoding': 'gzip, deflate, br',  # gzip, deflate, brotli
+
+        # 5. Connection: 연결 유지
+        'Connection': 'keep-alive',  # 여러 요청에 같은 연결 재사용
+
+        # 6. Referer: 어디서 왔는지 (이전 페이지)
+        'Referer': 'https://www.instagram.com/',
+
+        # 7. Instagram 전용 헤더들
+        'X-Instagram-AJAX': '1',  # AJAX 요청임을 표시
+        'X-Requested-With': 'XMLHttpRequest',  # XHR 요청
+
+        # 8. 보안 헤더
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+
+        # 9. 브라우저 힌트 (최신 크롬만 보냄)
+        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="142"',
+        'Sec-Ch-Ua-Mobile': '?0',  # 모바일 아님
+        'Sec-Ch-Ua-Platform': '"Linux"',
+    }
+
+    if not empty_session_only and self._session:
+        # 로그인한 경우 추가 헤더
+        header['X-CSRFToken'] = self._session.cookies.get('csrftoken', '')
+
+    return header
+```
+
+##### 왜 이렇게 많은 헤더가 필요한가?
+
+**실험: 헤더를 하나씩 빼보면?**
+
+```python
+# 1. User-Agent만 빼면?
+→ 403 Forbidden (즉시 차단)
+
+# 2. X-Instagram-AJAX 빼면?
+→ 400 Bad Request (잘못된 요청)
+
+# 3. Referer 빼면?
+→ 200 OK (동작은 하지만 의심스러움)
+
+# 4. Accept-Language 빼면?
+→ 200 OK (동작함, 영어로 응답)
+
+# 5. Sec-Fetch-* 빼면?
+→ 200 OK (오래된 브라우저로 인식됨)
+
+결론: User-Agent, X-Instagram-AJAX는 필수!
+```
+
+##### 실제 브라우저 vs Instaloader 헤더 비교
+
+```http
+=== 실제 크롬 브라우저 (F12로 확인) ===
+:authority: www.instagram.com
+:method: POST
+:path: /graphql/query
+:scheme: https
+accept: */*
+accept-encoding: gzip, deflate, br
+accept-language: en-US,en;q=0.9
+content-type: application/x-www-form-urlencoded
+cookie: sessionid=...; csrftoken=...
+origin: https://www.instagram.com
+referer: https://www.instagram.com/nike/
+sec-ch-ua: "Not_A Brand";v="8", "Chromium";v="142"
+sec-ch-ua-mobile: ?0
+sec-ch-ua-platform: "Linux"
+sec-fetch-dest: empty
+sec-fetch-mode: cors
+sec-fetch-site: same-origin
+user-agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/142.0.0.0
+x-csrftoken: ABC123...
+x-instagram-ajax: 1
+x-requested-with: XMLHttpRequest
+
+=== Instaloader ===
+(위와 100% 동일!)
+```
 
 ---
 
@@ -474,23 +1405,186 @@ POST /graphql/query
 
 ### 3.2 Instagram의 GraphQL 구조
 
-Instagram은 수백 개의 "미리 만들어진 쿼리"를 제공함. 각각에 고유 번호(doc_id)가 있음:
+#### doc_id가 뭐길래?
+
+Instagram은 수백 개의 "미리 만들어진 쿼리"를 제공함. 각각에 고유 번호(doc_id)가 있음.
+
+**왜 이렇게 복잡하게 만들었을까?**
+
+```
+일반 GraphQL (Facebook이 만든 원본):
+  - 사용자가 직접 쿼리 작성
+  - 예: "{ user(id: 123) { name, posts { title } } }"
+  - 유연하지만, 악의적 쿼리 가능
+  - 예: "{ user { posts { comments { replies { ... 무한 반복 } } } }" ← 서버 폭파!
+
+Instagram의 GraphQL (제한된 버전):
+  - Instagram이 미리 만든 쿼리만 사용 가능
+  - 각 쿼리에 번호(doc_id) 부여
+  - 사용자는 번호만 선택 + 변수만 입력
+  - 안전하고 성능 최적화됨
+```
+
+**실제 doc_id 목록:**
 
 ```python
 # Instagram이 정해놓은 쿼리 목록 (일부)
 
-"7950326061742207"  # 익명으로 프로필 게시글 조회
-"7898261790222653"  # 로그인해서 프로필 게시글 조회
-"8845758582119845"  # 특정 게시글 상세 정보
-"7845543455542541"  # 릴스 조회
-"f883d95537fbcd400f466f63d42bd8a1"  # 저장한 게시물
+# 프로필 관련
+"7950326061742207"  # 익명으로 프로필 게시글 조회 (GraphImage, GraphVideo 등)
+"7898261790222653"  # 로그인해서 프로필 게시글 조회 (더 많은 정보 포함)
+"7c16654f22c819fb63d1183034a5162f"  # 프로필 메타데이터 (팔로워, 팔로잉 수 등)
+
+# 게시글 관련
+"8845758582119845"  # 특정 게시글 상세 정보 (shortcode로 조회)
+"7845543455542541"  # 릴스 목록
+"f883d95537fbcd400f466f63d42bd8a1"  # 저장한 게시물 (로그인 필요)
+"e31a871f7301132ceaab56507a66bbb7"  # 태그된 게시물
+
+# 스토리/하이라이트 관련
+"ba71d2e6d08839fc7b1897f04e2e1a90"  # 스토리 목록 (로그인 필요)
+"45246d3fe16ccc6577e0bd297a5db1ab"  # 하이라이트 목록
+
+# 인터랙션 관련
+"d4d88dc1500312af6f937f7b804c68c3"  # 좋아요 누른 사용자 목록
+"bc3296d1ce80a24b1b6e40b1e72903f5"  # 댓글 목록
+"1cb6ec562846122743b61e492c85999f"  # 팔로워 목록
+"c76146de99bb02f6415203be841dd25a"  # 팔로잉 목록
+
+# 검색 관련
+"7c8a1055f69f5069e4c7ae3f2b2f7e6c"  # 해시태그 검색
+"6b802d0e3a64a3e3d6c1f7b2e8f7e6d5"  # 위치 태그 검색
 ```
 
+#### doc_id는 어떻게 찾았을까?
+
+**방법 1: 브라우저 개발자 도구로 직접 보기**
+
+```
+1. 크롬에서 Instagram 열기
+2. F12 누르기 (개발자 도구)
+3. Network 탭 선택
+4. Fetch/XHR 필터 켜기
+5. Instagram에서 프로필 방문
+6. graphql/query 요청 찾기
+7. Request Payload 확인
+   → doc_id: "7950326061742207" 발견!
+```
+
+**방법 2: Instagram JavaScript 파일 분석**
+
+Instagram의 웹 앱은 React로 만들어짐. JavaScript 파일 안에 모든 doc_id가 하드코딩되어 있음:
+
+```javascript
+// Instagram의 JavaScript 코드 (난독화되어 있음)
+e.exports = {
+  ProfilePostsQuery: "7950326061742207",
+  FeedTimelineQuery: "7898261790222653",
+  PostDetailQuery: "8845758582119845",
+  // ... 수백 개 더
+}
+```
+
+Instaloader 개발자들은 이 파일을 정기적으로 분석해서 doc_id를 업데이트함.
+
 💡 **비유: 패스트푸드 메뉴판**
-- 1번: 불고기버거 세트
-- 2번: 치킨버거 세트
-- 3번: 새우버거 세트
-- doc_id는 이 "메뉴 번호"와 같음
+```
+일반 주문:
+  손님: "빵, 패티, 치즈, 양상추, 토마토, 소스 조합해주세요"
+  직원: "???" (복잡함, 실수 가능)
+
+메뉴 번호 주문:
+  손님: "1번 세트요" (doc_id)
+  직원: "불고기버거 세트죠? 사이즈는요?" (variables)
+  손님: "라지요"
+  직원: "바로 나갑니다" (빠르고 정확)
+
+Instagram도 마찬가지:
+  - doc_id = 메뉴 번호
+  - variables = 사이즈, 옵션
+```
+
+#### doc_id의 생명주기
+
+```mermaid
+flowchart TD
+    A[Instagram 개발자가<br/>새 기능 개발] --> B[GraphQL 쿼리 작성]
+    B --> C[쿼리에 doc_id 부여<br/>예: 7950326061742207]
+    C --> D[JavaScript 번들에 포함]
+    D --> E[웹 배포]
+
+    E --> F{Instaloader 개발자}
+    F --> G[JavaScript 파일 다운로드]
+    G --> H[난독화 코드 분석]
+    H --> I[doc_id 추출]
+    I --> J[Instaloader 코드 업데이트]
+
+    E --> K{사용자}
+    K --> L[브라우저로 Instagram 방문]
+    L --> M[JavaScript 실행]
+    M --> N[doc_id로 API 호출]
+
+    J --> O{Instaloader 사용자}
+    O --> P[instaloader nike 실행]
+    P --> N
+
+    style C fill:#9f9
+    style I fill:#9f9
+    style N fill:#9f9
+```
+
+#### variables란 무엇인가?
+
+doc_id는 "어떤 종류의 쿼리"인지 결정하고, variables는 "구체적인 조건"을 지정함.
+
+**예시: 프로필 게시글 조회**
+
+```python
+# doc_id는 고정
+doc_id = "7950326061742207"  # "프로필 게시글 조회" 쿼리
+
+# variables로 구체적 조건 지정
+variables = {
+    "id": "25025320",       # 어떤 사용자? (nike의 ID)
+    "first": 12,            # 몇 개? (12개)
+    "after": None           # 어디서부터? (처음부터 = None)
+}
+
+# 다른 사용자 조회는 variables만 바꾸면 됨
+variables2 = {
+    "id": "123456789",      # adidas의 ID
+    "first": 24,            # 24개 가져오기
+    "after": "QVFBb..."     # 두 번째 페이지부터
+}
+```
+
+**variables의 일반적인 필드들:**
+
+| 필드 | 타입 | 설명 | 예시 |
+|------|------|------|------|
+| `id` | 문자열 | 사용자 ID (숫자지만 문자열로 전송) | `"25025320"` |
+| `username` | 문자열 | 사용자 이름 | `"nike"` |
+| `first` | 숫자 | 가져올 개수 (페이지 크기) | `12` |
+| `after` | 문자열 | 페이지네이션 커서 (다음 페이지) | `"QVFBb3dzODE..."` |
+| `shortcode` | 문자열 | 게시글 ID | `"ABC123xyz"` |
+| `include_reel` | 불린 | 릴스 포함 여부 | `true` |
+| `fetch_mutual` | 불린 | 맞팔 여부 포함 | `false` |
+
+**실제 요청 예시:**
+
+```http
+POST /graphql/query HTTP/1.1
+Host: www.instagram.com
+Content-Type: application/x-www-form-urlencoded
+
+doc_id=7950326061742207&variables={"id":"25025320","first":12,"after":null}
+```
+
+이것을 URL 인코딩하면:
+
+```
+doc_id=7950326061742207&variables=%7B%22id%22%3A%2225025320%22%2C%22first%22%3A12%2C%22after%22%3Anull%7D
+```
 
 ### 3.3 실제 요청 과정 보기
 
